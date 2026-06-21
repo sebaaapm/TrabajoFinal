@@ -1,0 +1,278 @@
+---
+title: "r final"
+output:
+  pdf_document: default
+  html_document: default
+date: "2026-06-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# ---- Paquetes -------------------------------------------------------
+
+library(readxl); library(dplyr)
+library(MASS)          # glm.nb (binomial negativa)
+library(AER)           # dispersiontest
+library(modelsummary)  # tablas de modelos
+library(sandwich); library(lmtest)   # SE agrupados
+library(knitr); library(kableExtra)  # tablas estilo clase
+library(ggplot2); library(e1071)     # gráficos y asimetría
+library(dotwhisker)    # gráfico de coeficientes
+library(car)           # vif
+```
+
+```{r}
+# 1. Preparación de los datos
+datos <- read_excel("basereal.xlsx")
+
+# nombres manejables
+names(datos)[names(datos) == "% de ejecución"] <- "ejec"
+names(datos)[names(datos) == "Población"]      <- "poblacion"
+names(datos)[names(datos) == "Población Económicamente Activa (PEA)"] <- "pea"
+names(datos)[names(datos) == "IDH"]            <- "idh"
+```
+
+```{r}
+# una fila por distrito y casos completos
+datos <- datos %>%
+  filter(!is.na(UBIGEO)) %>%
+  distinct(UBIGEO, .keep_all = TRUE) %>%
+  filter(pea > 0) %>%
+  filter(complete.cases(across(c(mineros, ide, ejec, monto_total_soles,
+                                 dist_capital_dep_km, idh, pea, poblacion))))
+```
+
+```{r}
+# transformaciones
+datos$log_monto <- log1p(datos$monto_total_soles)  # asimetría fuerte -> log
+datos$dist100   <- datos$dist_capital_dep_km / 100 # por cada 100 km
+datos$log_pea   <- log(datos$pea)
+datos$log_pob   <- log(datos$poblacion)
+datos$ide10     <- datos$ide * 10                  # IDE por cada 0.1
+```
+
+```{r}
+#Ver el número de distritos a analizar
+cat("N de distritos para el análisis:", nrow(datos), "\n")
+#1551
+```
+
+```{r}
+#2Descriptivos de la variable dependiente
+VarDep <- datos$mineros
+descris <- data.frame(
+  Estadistico = c("Mínimo","Máximo","Media","Varianza","% ceros",
+                  "Razón var/media","Asimetría"),
+  Valor = c(min(VarDep), max(VarDep), round(mean(VarDep),1),
+            round(var(VarDep)), round(mean(VarDep==0)*100,1),
+            round(var(VarDep)/mean(VarDep)), round(skewness(VarDep),1)))
+descris %>% kable(caption="Variable dependiente: mineros (REINFO)") %>%
+  kable_styling(full_width = FALSE)
+# Se descarta OLS; anticipa sobredispersión (Poisson será inadecuado)
+```
+
+```{r}
+# histograma 
+ggplot(datos, aes(x = mineros)) + theme_classic() +
+  geom_histogram(bins = 50) +
+  annotate("text", x = max(VarDep)*0.6, y = 400,
+           label = paste0("Min: ", min(VarDep),
+                          "\nMax: ", max(VarDep),
+                          "\nMedia: ", round(mean(VarDep),1),
+                          "\nVarianza: ", round(var(VarDep)),
+                          "\nAsimetría: ", round(skewness(VarDep),1))) +
+  labs(title = "Distribución de 'mineros' por distrito",
+       x = "Número de mineros (REINFO)", y = "Frecuencia")
+```
+
+```{r}
+#3 Exploración de predictores y Selección de variables
+# =====================================================================
+# Roles 
+#   ide / ejec               -> variables de INTERÉS (hipótesis)
+#   log_monto                -> control Estructural (geología)
+#   dist100                  -> control de aislamiento
+#   idh                      -> control de desarrollo
+#   log_pea                  -> control de tamaño poblacional
+
+# correlaciones bivariadas (Spearman: robusto a colas pesadas)
+sapply(c("ide","ejec","log_monto","dist100","idh","log_pea"),
+       function(v) round(cor(datos$mineros, datos[[v]],
+                             method = "spearman"), 3))
+```
+
+```{r}
+
+```
+
+```{r}
+cor(datos$idh, datos$`Ingreso real per cápita del hogar`,
+    method = "spearman")
+#por qué no usar ingreso, similares
+```
+
+```{r}
+# 4 Modelo de partida: POISSON
+f_pob <- mineros ~ ide10 + ejec + log_monto + dist100 + idh + log_pob
+rp  <- glm(f_pob, family = poisson, data = datos)
+summary(rp)
+```
+
+```{r}
+#5 Test de sobredispersión (sección equidispersión, Sesión 3)
+# =====================================================================
+# H0: equidispersión (Poisson adecuado) | H1: sobredispersión
+overdispersion  <- AER::dispersiontest(rp, alternative = "greater")$p.value < 0.05
+underdispersion <- AER::dispersiontest(rp, alternative = "less")$p.value    < 0.05
+data.frame(Hipotesis = c("Sobredispersión","Subdispersión"),
+           "Es probable" = c(overdispersion, underdispersion)) %>%
+  kable(caption = "Test de Equidispersión") %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# 6 Quasi-Poisson y Binomial Negativa + TABLA AIC/BIC
+# =====================================================================
+rqp <- glm(f_pob, family = quasipoisson, data = datos)  # corrige SE
+rbn <- glm.nb(f_pob, data = datos) 
+```
+
+```{r}
+#6 tabla comparada de coeficientes (IRR) de los tres modelos
+modelsummary(list("Poisson" = rp, "Quasi-Poisson" = rqp,
+                  "Binomial Negativa" = rbn),
+             exponentiate = TRUE, statistic = "conf.int",
+             stars = TRUE, fmt = 4,
+             title = "Modelos de conteo: IRR = exp(coef)")
+```
+
+```{r}
+#6
+data.frame(Model = c("poisson", "quasipoisson", "negative-binomial"),
+           AIC = c(AIC(rp), AIC(rqp), AIC(rbn)),
+           BIC = c(BIC(rp), BIC(rqp), BIC(rbn)),
+           stringsAsFactors = FALSE) %>%
+  kable(caption = "AIC / BIC para los modelos de conteos") %>%
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+```{r}
+#7 Test del offset
+nb_pob_libre <- glm.nb(mineros ~ ide10 + ejec + log_monto + dist100 +
+                         idh + log_pob, data = datos)
+confint(nb_pob_libre)["log_pob", ]   # IC ~[0.23, 0.39] -> NO incluye 1
+```
+
+```{r}
+nb_pea_libre <- glm.nb(mineros ~ ide10 + ejec + log_monto + dist100 +
+                         idh + log_pea, data = datos)
+confint(nb_pea_libre)["log_pea", ]   # IC ~[0.25, 0.41] -> NO incluye 1
+```
+
+```{r}
+AIC(nb_pob_libre, nb_pea_libre)
+```
+
+```{r}
+#8 modelos Justificación de la especificación (modelos anidados)
+# =====================================================================
+
+m0 <- glm.nb(mineros ~ log_monto + log_pea, data = datos)
+m1 <- glm.nb(mineros ~ log_monto + log_pea + ide10, data = datos)
+m2 <- glm.nb(mineros ~ log_monto + log_pea + ide10 + ejec, data = datos)
+m3 <- glm.nb(mineros ~ log_monto + log_pea + ide10 + ejec + dist100,
+             data = datos)
+m4 <- glm.nb(mineros ~ log_monto + log_pea + ide10 + ejec + dist100 + idh,
+             data = datos)
+```
+
+```{r}
+lrtest(m0, m1)   # ¿aporta IDE?       -> sí
+
+```
+
+```{r}
+lrtest(m1, m2)   # ¿aporta ejecución? -> no (se conserva: es hipótesis)
+```
+
+```{r}
+lrtest(m2, m3)   # ¿aporta distancia? -> sí
+```
+
+```{r}
+lrtest(m3, m4)   # ¿aporta IDH?       -> evaluar (se conserva: control)
+```
+
+```{r}
+#9 
+AIC(m0, m1, m2, m3, m4)
+```
+
+```{r}
+#9
+BIC(m0, m1, m2, m3, m4)
+```
+
+```{r}
+#10
+modelo_final <- m4
+summary(modelo_final)
+exp(coef(modelo_final)) 
+```
+
+```{r}
+#11 Colinealidad
+car::vif(modelo_final)
+
+```
+
+```{r}
+#12 Comparar modelos
+dwplot(list(Poisson = rp, CuasiPoisson = rqp, BinomialNegativa = rbn),
+       exp = TRUE) +
+  scale_x_log10() +
+  scale_y_discrete(labels = c("log_pob"  = "Población (log)",
+                              "idh"       = "IDH",
+                              "dist100"   = "Distancia (100 km)",
+                              "log_monto" = "Geología (log)",
+                              "ejec"      = "% ejecución",
+                              "ide10"     = "IDE (por 0.1)")) +
+  scale_color_discrete(name = "Modelos para:\nMineros informales") +
+  geom_vline(xintercept = 1, colour = "grey60", linetype = 2) +
+  labs(x = "IRR (escala log)", y = NULL,
+       title = "Comparación de coeficientes entre modelos")
+
+```
+
+```{r}
+#13 Coeficientes del modelo final
+modelplot(modelo_final, exponentiate = TRUE) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  scale_x_log10() +
+  labs(title = "Modelo final (Binomial Negativa) — IRR",
+       x = "IRR (escala log; 1 = sin efecto)")
+
+```
+
+```{r}
+#10
+
+```
+
+```{r}
+#10
+
+```
+
+```{r}
+#10
+
+```
+
+```{r}
+#10
+
+```
